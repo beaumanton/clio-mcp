@@ -8,20 +8,22 @@ import { appendAuditLog } from "../utils/auditLog.js";
  * book.
  *
  * The naive shape of this is a loop: for each open matter, fetch its notes, its
- * time entries, its calendar entries, its tasks. On a few hundred matters that
- * is over a thousand requests, it takes minutes, and it walks straight into
+ * calendar entries, its tasks. On a few hundred matters that is approaching a
+ * thousand requests, it takes minutes, and it walks straight into
  * Clio's rate limiter. So this fetches each collection ONCE, account-wide and
  * bounded by date, then groups by matter id in memory. Cost is roughly a
  * handful of paginated reads regardless of how many matters the firm has.
  *
- * The output is deliberately dates and counts only, never note bodies or time
- * entry narratives: it is a triage pass meant to decide which matters deserve a
- * closer look, and keeping it thin is what makes it cheap to run over the whole
- * book on a schedule.
+ * The output is deliberately dates and counts only, never note bodies: it is a
+ * triage pass meant to decide which matters deserve a closer look, and keeping
+ * it thin is what makes it cheap to run over the whole book on a schedule.
+ *
+ * This fork never reads Clio's activities endpoint (time entries and expenses),
+ * so "last activity" here means the newest matter note.
  */
 
 /**
- * Page budget per collection. Five collections are read in parallel and the
+ * Page budget per collection. Four collections are read in parallel and the
  * whole tool has to answer inside an MCP client's request timeout (60s in Claude
  * Desktop). A firm large enough to blow past this gets a clear error naming the
  * knobs that shrink the window, rather than a client-side timeout with no
@@ -32,7 +34,6 @@ const SUMMARY_MAX_PAGES = 25;
 
 const SUMMARY_MATTER_FIELDS = "id,display_number,description,status,client{id,name}";
 const SUMMARY_NOTE_FIELDS = "id,date,created_at,matter{id}";
-const SUMMARY_ACTIVITY_FIELDS = "id,date,matter{id}";
 const SUMMARY_CALENDAR_FIELDS = "id,summary,start_at,matter{id}";
 const SUMMARY_TASK_FIELDS = "id,due_at,status,matter{id}";
 
@@ -81,7 +82,7 @@ export function registerActivitySummaryTools(server: McpServer): void {
     "matter_activity_summary",
     {
       description:
-        "Activity snapshot for every open matter in one call: last note, last time entry, next calendar entry, open task count, and days since anything happened. Sorted by staleness, so matters with no recent file activity come first. Use this as the cheap first pass of a case-monitoring sweep, then look closely only at what it flags.",
+        "Activity snapshot for every open matter in one call: last note, next calendar entry, open task count, and days since the last note. Sorted by staleness, so matters with no recent notes come first. Use this as the cheap first pass of a case-monitoring sweep, then look closely only at what it flags.",
       inputSchema: {
         lookback_days: z
           .number()
@@ -90,7 +91,7 @@ export function registerActivitySummaryTools(server: McpServer): void {
           .max(365)
           .default(90)
           .describe(
-            "How far back to look for notes and time entries. A matter with nothing in this window reports " +
+            "How far back to look for notes. A matter with nothing in this window reports " +
               "null and counts as maximally stale. Staleness uses a note's own date, not when it was imported, " +
               "so a note created inside the window but dated years earlier can push days_since_last_activity " +
               "well past lookback_days; that is the event date doing its job, not a bug. Capped at 365 because " +
@@ -124,7 +125,6 @@ export function registerActivitySummaryTools(server: McpServer): void {
       try {
         const now = Date.now();
         const since = isoDaysAgo(lookback_days, now);
-        const sinceDate = since.slice(0, 10);
         const todayDate = new Date(now).toISOString().slice(0, 10);
         const aheadDate = new Date(now + calendar_days_ahead * 86_400_000).toISOString().slice(0, 10);
 
@@ -135,7 +135,7 @@ export function registerActivitySummaryTools(server: McpServer): void {
         };
         if (practice_area_id) matterParams["practice_area_id"] = String(practice_area_id);
 
-        // Five account-wide reads, not five per matter.
+        // Four account-wide reads, not four per matter.
         const readAll = (path: string, params: Record<string, string>) =>
           clioGetAllPages(path, params, { maxPages: SUMMARY_MAX_PAGES }).catch((err: any) => {
             if (typeof err?.message === "string" && err.message.includes("exceeded maxPages")) {
@@ -148,17 +148,12 @@ export function registerActivitySummaryTools(server: McpServer): void {
             throw err;
           });
 
-        const [matters, notes, activities, calendarEntries, tasks] = await Promise.all([
+        const [matters, notes, calendarEntries, tasks] = await Promise.all([
           readAll("/matters.json", matterParams),
           readAll("/notes.json", {
             fields: SUMMARY_NOTE_FIELDS,
             type: "matter",
             created_since: since,
-            limit: "200",
-          }),
-          readAll("/activities.json", {
-            fields: SUMMARY_ACTIVITY_FIELDS,
-            start_date: sinceDate,
             limit: "200",
           }),
           readAll("/calendar_entries.json", {
@@ -175,20 +170,16 @@ export function registerActivitySummaryTools(server: McpServer): void {
         ]);
 
         const notesByMatter = groupByMatter(notes);
-        const activitiesByMatter = groupByMatter(activities);
         const calendarByMatter = groupByMatter(calendarEntries);
         const tasksByMatter = groupByMatter(tasks);
 
         const rows = matters.map((m: any) => {
           const lastNote = latest((notesByMatter.get(m.id) ?? []).map((n) => n.date ?? n.created_at));
-          const lastTimeEntry = latest((activitiesByMatter.get(m.id) ?? []).map((a) => a.date));
 
           const upcoming = (calendarByMatter.get(m.id) ?? [])
             .filter((c) => c.start_at && Date.parse(c.start_at) >= now)
             .sort((a, b) => Date.parse(a.start_at) - Date.parse(b.start_at));
           const nextEntry = upcoming[0] ?? null;
-
-          const lastActivity = latest([lastNote, lastTimeEntry]);
 
           return {
             matter_id: m.id,
@@ -196,15 +187,15 @@ export function registerActivitySummaryTools(server: McpServer): void {
             description: m.description,
             client: m.client?.name ?? null,
             last_note_date: lastNote,
-            last_time_entry_date: lastTimeEntry,
             next_calendar_entry: nextEntry
               ? { start_at: nextEntry.start_at, summary: nextEntry.summary ?? null }
               : null,
             open_tasks_count: (tasksByMatter.get(m.id) ?? []).length,
-            // null means nothing at all inside the lookback window, which is a
+            // Notes are the only activity signal. null means no note inside the
+            // lookback window, which is a
             // stronger signal than any number this can return. Sorting treats it
             // as the stalest possible value for exactly that reason.
-            days_since_last_activity: daysBetween(lastActivity, now),
+            days_since_last_activity: daysBetween(lastNote, now),
           };
         });
 

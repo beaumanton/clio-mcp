@@ -33,18 +33,16 @@ const ARGS = { lookback_days: 90, calendar_days_ahead: 90, limit: 100 };
 const MATTER_A = { id: 1, display_number: "00001-001", description: "Busy matter", status: "open", client: { id: 9, name: "Acme" } };
 const MATTER_B = { id: 2, display_number: "00002-001", description: "Quiet matter", status: "open", client: { id: 8, name: "Beta" } };
 
-/** Wires the five account-wide reads in the order the tool issues them. */
+/** Wires the four account-wide reads. Any other path, activities included, throws. */
 function mockCollections(opts: {
   matters?: any[];
   notes?: any[];
-  activities?: any[];
   calendar?: any[];
   tasks?: any[];
 }) {
   mockClioGetAllPages.mockImplementation(async (path: string) => {
     if (path === "/matters.json") return opts.matters ?? [];
     if (path === "/notes.json") return opts.notes ?? [];
-    if (path === "/activities.json") return opts.activities ?? [];
     if (path === "/calendar_entries.json") return opts.calendar ?? [];
     if (path === "/tasks.json") return opts.tasks ?? [];
     throw new Error(`unexpected path ${path}`);
@@ -73,15 +71,22 @@ describe("matter_activity_summary", () => {
       // matters is a thousand-plus requests and walks into the rate limiter.
       mockCollections({ matters: [MATTER_A, MATTER_B] });
       await run();
-      expect(mockClioGetAllPages).toHaveBeenCalledTimes(5);
+      expect(mockClioGetAllPages).toHaveBeenCalledTimes(4);
       const paths = mockClioGetAllPages.mock.calls.map((c) => c[0]).sort();
       expect(paths).toEqual([
-        "/activities.json",
         "/calendar_entries.json",
         "/matters.json",
         "/notes.json",
         "/tasks.json",
       ]);
+    });
+
+    it("never reads Clio's activities endpoint (time entries and expenses)", async () => {
+      mockCollections({ matters: [MATTER_A, MATTER_B] });
+      const { result, parsed } = await run();
+      expect(result.isError).toBeUndefined();
+      expect(mockClioGetAllPages.mock.calls.some((c) => c[0] === "/activities.json")).toBe(false);
+      expect(parsed.matters[0]).not.toHaveProperty("last_time_entry_date");
     });
 
     it("asks Clio only for open matters", async () => {
@@ -91,14 +96,12 @@ describe("matter_activity_summary", () => {
       expect(matterCall[1].status).toBe("open");
     });
 
-    it("bounds notes and time entries by the lookback window", async () => {
+    it("bounds notes by the lookback window", async () => {
       mockCollections({ matters: [MATTER_A] });
       await run({ lookback_days: 30 });
       const notes = mockClioGetAllPages.mock.calls.find((c) => c[0] === "/notes.json")!;
-      const acts = mockClioGetAllPages.mock.calls.find((c) => c[0] === "/activities.json")!;
       expect(notes[1].created_since).toBe("2026-08-02T12:00:00.000Z");
       expect(notes[1].type).toBe("matter");
-      expect(acts[1].start_date).toBe("2026-08-02");
     });
 
     it("looks forward, not back, for the calendar", async () => {
@@ -118,22 +121,17 @@ describe("matter_activity_summary", () => {
   });
 
   describe("per-matter rollup", () => {
-    it("takes the newest note and time entry per matter", async () => {
+    it("takes the newest note per matter and measures staleness from it", async () => {
       mockCollections({
         matters: [MATTER_A],
         notes: [
           { id: 1, date: "2026-08-01", matter: { id: 1 } },
           { id: 2, date: "2026-08-20", matter: { id: 1 } },
         ],
-        activities: [
-          { id: 3, date: "2026-08-10", matter: { id: 1 } },
-          { id: 4, date: "2026-08-25", matter: { id: 1 } },
-        ],
       });
       const { parsed } = await run();
       expect(parsed.matters[0].last_note_date).toBe("2026-08-20");
-      expect(parsed.matters[0].last_time_entry_date).toBe("2026-08-25");
-      expect(parsed.matters[0].days_since_last_activity).toBe(7);
+      expect(parsed.matters[0].days_since_last_activity).toBe(12);
     });
 
     it("prefers the note's own date over when it was typed up", async () => {
@@ -252,15 +250,13 @@ describe("matter_activity_summary", () => {
   });
 
   describe("output hygiene", () => {
-    it("returns dates and counts only, never note or time entry text", async () => {
+    it("returns dates and counts only, never note text", async () => {
       mockCollections({
         matters: [MATTER_A],
         notes: [{ id: 1, date: "2026-08-30", detail: "Client disclosed settlement position", matter: { id: 1 } }],
-        activities: [{ id: 2, date: "2026-08-29", note: "Reviewed privileged memo", matter: { id: 1 } }],
       });
       const { result } = await run();
       expect(result.content[0].text).not.toContain("settlement position");
-      expect(result.content[0].text).not.toContain("privileged memo");
     });
   });
 
@@ -293,7 +289,7 @@ describe("page budget", () => {
     mockClioGetAllPages.mockResolvedValue([]);
     await handlers["matter_activity_summary"](ARGS);
 
-    expect(mockClioGetAllPages).toHaveBeenCalledTimes(5);
+    expect(mockClioGetAllPages).toHaveBeenCalledTimes(4);
     for (const call of mockClioGetAllPages.mock.calls) {
       expect(call[2], `${call[0]} was read without a page budget`).toMatchObject({ maxPages: expect.any(Number) });
     }

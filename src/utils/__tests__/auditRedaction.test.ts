@@ -109,7 +109,6 @@ describe("redactAuditArgs", () => {
   });
 
   it.each([
-    ["log_time_entry", { matter_id: 1, date: "2026-01-01", quantity_in_hours: 0.5, note: "Called opposing counsel" }, ["note"]],
     ["create_note", { matter_id: 1, subject: "Strategy", body: "Client wants to settle" }, ["subject", "body"]],
     ["create_task", { matter_id: 1, name: "File motion", description: "By Friday", priority: "High" }, ["name", "description"]],
     ["create_calendar_entry", { summary: "Deposition of J. Doe", start_at: "2026-01-01", end_at: "2026-01-01", calendar_owner_id: 5, description: "Room 4", location: "Court" }, ["summary", "description", "location"]],

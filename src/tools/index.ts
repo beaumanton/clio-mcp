@@ -25,8 +25,6 @@ import { registerRelationshipTools } from "./relationships.js";
 import { registerActivitySummaryTools } from "./activitySummary.js";
 import { registerTaskTools } from "./tasks.js";
 import { registerCalendarTools } from "./calendar.js";
-import { registerActivityTools } from "./activities.js";
-import { registerBillingTools } from "./billing.js";
 import { registerNoteTools } from "./notes.js";
 import { registerUserTools } from "./users.js";
 import { registerAuditExportTool } from "./auditExport.js";
@@ -51,8 +49,6 @@ export const WRITE_TOOLS: ReadonlySet<string> = new Set([
   "update_task",
   "complete_task",
   "create_calendar_entry",
-  "log_time_entry",
-  "create_activity",
   "create_note",
   "update_matter",
   "create_folder",
@@ -102,13 +98,6 @@ export const TOOL_META: Readonly<Record<string, ToolMeta>> = {
   list_calendar_entries: { title: "List calendar entries", readOnly: true },
   list_calendars: { title: "List calendars", readOnly: true },
   create_calendar_entry: { title: "Create calendar entry", readOnly: false },
-  // activities
-  list_time_entries: { title: "List time entries", readOnly: true },
-  list_expenses: { title: "List expenses", readOnly: true },
-  log_time_entry: { title: "Log time entry", readOnly: false },
-  create_activity: { title: "Create activity", readOnly: false },
-  // billing
-  get_billing_summary: { title: "Get billing summary", readOnly: true },
   // notes
   create_note: { title: "Create note", readOnly: false },
   list_notes: { title: "List notes", readOnly: true },
@@ -131,8 +120,6 @@ export const REGISTRARS: ReadonlyArray<(server: McpServer) => void> = [
   registerActivitySummaryTools,
   registerTaskTools,
   registerCalendarTools,
-  registerActivityTools,
-  registerBillingTools,
   registerNoteTools,
   registerUserTools,
   registerAuditExportTool,

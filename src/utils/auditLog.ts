@@ -153,13 +153,6 @@ export const AUDIT_ARG_ALLOWLIST: RedactPolicy = {
   list_calendar_entries: ["from", "to"],
   list_calendars: [],
   create_calendar_entry: ["start_at", "end_at", "calendar_owner_id", "all_day", "matter_id", "send_email_notification", "attendee_ids"],
-  // time entries and activities (never the note or reference text)
-  list_time_entries: ["matter_id", "start_date", "end_date", "limit"],
-  list_expenses: ["matter_id", "user_id", "start_date", "end_date", "expense_type", "limit"],
-  log_time_entry: ["matter_id", "date", "quantity_in_hours", "price", "non_billable", "no_charge", "activity_description_id", "user_id"],
-  create_activity: ["type", "date", "matter_id", "quantity_in_hours", "price", "non_billable", "no_charge", "activity_description_id", "user_id", "tax_setting"],
-  // billing
-  get_billing_summary: ["matter_id"],
   // notes (never subject or body)
   create_note: ["matter_id"],
   list_notes: ["matter_id", "contact_id", "created_since", "updated_since", "limit", "page_token"],
