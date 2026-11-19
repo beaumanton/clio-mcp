@@ -33,18 +33,25 @@ const ARGS = { lookback_days: 90, calendar_days_ahead: 90, limit: 100 };
 const MATTER_A = { id: 1, display_number: "00001-001", description: "Busy matter", status: "open", client: { id: 9, name: "Acme" } };
 const MATTER_B = { id: 2, display_number: "00002-001", description: "Quiet matter", status: "open", client: { id: 8, name: "Beta" } };
 
-/** Wires the four account-wide reads. Any other path, activities included, throws. */
+/**
+ * Wires the six account-wide reads. Tasks and calendar entries are each read
+ * twice: once for the count / next entry, and once with updated_since for the
+ * activity date. Any other path, activities included, throws.
+ */
 function mockCollections(opts: {
   matters?: any[];
   notes?: any[];
   calendar?: any[];
   tasks?: any[];
+  changedTasks?: any[];
+  changedCalendar?: any[];
 }) {
-  mockClioGetAllPages.mockImplementation(async (path: string) => {
+  mockClioGetAllPages.mockImplementation(async (path: string, params: Record<string, string> = {}) => {
+    const isChangeRead = "updated_since" in params;
     if (path === "/matters.json") return opts.matters ?? [];
     if (path === "/notes.json") return opts.notes ?? [];
-    if (path === "/calendar_entries.json") return opts.calendar ?? [];
-    if (path === "/tasks.json") return opts.tasks ?? [];
+    if (path === "/calendar_entries.json") return (isChangeRead ? opts.changedCalendar : opts.calendar) ?? [];
+    if (path === "/tasks.json") return (isChangeRead ? opts.changedTasks : opts.tasks) ?? [];
     throw new Error(`unexpected path ${path}`);
   });
 }
@@ -71,12 +78,14 @@ describe("matter_activity_summary", () => {
       // matters is a thousand-plus requests and walks into the rate limiter.
       mockCollections({ matters: [MATTER_A, MATTER_B] });
       await run();
-      expect(mockClioGetAllPages).toHaveBeenCalledTimes(4);
+      expect(mockClioGetAllPages).toHaveBeenCalledTimes(6);
       const paths = mockClioGetAllPages.mock.calls.map((c) => c[0]).sort();
       expect(paths).toEqual([
         "/calendar_entries.json",
+        "/calendar_entries.json",
         "/matters.json",
         "/notes.json",
+        "/tasks.json",
         "/tasks.json",
       ]);
     });
@@ -104,10 +113,31 @@ describe("matter_activity_summary", () => {
       expect(notes[1].type).toBe("matter");
     });
 
+    it("reads task and calendar changes inside the lookback window, whatever their status or date", async () => {
+      mockCollections({ matters: [MATTER_A] });
+      await run({ lookback_days: 30 });
+      const changeRead = (path: string) =>
+        mockClioGetAllPages.mock.calls.find((c) => c[0] === path && "updated_since" in c[1])!;
+
+      const tasks = changeRead("/tasks.json");
+      expect(tasks[1].updated_since).toBe("2026-08-02T12:00:00.000Z");
+      // A completed task is still activity, so this read must not filter by status.
+      expect(tasks[1]).not.toHaveProperty("status");
+
+      const cal = changeRead("/calendar_entries.json");
+      expect(cal[1].updated_since).toBe("2026-08-02T12:00:00.000Z");
+      // Wide window: a changed entry can be dated well before or after today.
+      expect(Date.parse(cal[1].from)).toBeLessThan(Date.parse("2000-01-01T00:00:00Z"));
+      expect(Date.parse(cal[1].to)).toBeGreaterThan(Date.parse("2031-01-01T00:00:00Z"));
+
+      // Timestamps only: no task name or calendar summary is requested.
+      for (const read of [tasks, cal]) expect(read[1].fields).toBe("id,created_at,updated_at,matter{id}");
+    });
+
     it("looks forward, not back, for the calendar", async () => {
       mockCollections({ matters: [MATTER_A] });
       await run({ calendar_days_ahead: 14 });
-      const cal = mockClioGetAllPages.mock.calls.find((c) => c[0] === "/calendar_entries.json")!;
+      const cal = mockClioGetAllPages.mock.calls.find((c) => c[0] === "/calendar_entries.json" && !("updated_since" in c[1]))!;
       expect(cal[1].from).toBe("2026-09-01T00:00:00Z");
       expect(cal[1].to).toBe("2026-09-15T23:59:59Z");
     });
@@ -132,6 +162,73 @@ describe("matter_activity_summary", () => {
       const { parsed } = await run();
       expect(parsed.matters[0].last_note_date).toBe("2026-08-20");
       expect(parsed.matters[0].days_since_last_activity).toBe(12);
+    });
+
+    describe("days_since_last_activity", () => {
+      const note = { id: 1, date: "2026-08-12", matter: { id: 1 } }; // 20 days before NOW
+      const task = { id: 2, created_at: "2026-08-22T12:00:00Z", updated_at: "2026-08-22T12:00:00Z", matter: { id: 1 } }; // 10 days
+      const entry = { id: 3, created_at: "2026-08-27T12:00:00Z", updated_at: "2026-08-27T12:00:00Z", matter: { id: 1 } }; // 5 days
+
+      it.each([
+        ["the note when it is newest", { notes: [{ ...note, date: "2026-08-30" }], changedTasks: [task], changedCalendar: [entry] }, 2],
+        ["the task when it is newest", { notes: [note], changedTasks: [{ ...task, updated_at: "2026-08-31T12:00:00Z" }], changedCalendar: [entry] }, 1],
+        ["the calendar entry when it is newest", { notes: [note], changedTasks: [task], changedCalendar: [entry] }, 5],
+      ])("uses %s", async (_label, collections, expectedDays) => {
+        mockCollections({ matters: [MATTER_A], ...collections });
+        const { parsed } = await run();
+        expect(parsed.matters[0].days_since_last_activity).toBe(expectedDays);
+      });
+
+      it("reports the three dates it chose between", async () => {
+        mockCollections({ matters: [MATTER_A], notes: [note], changedTasks: [task], changedCalendar: [entry] });
+        const { parsed } = await run();
+        expect(parsed.matters[0]).toMatchObject({
+          last_note_date: "2026-08-12",
+          last_task_update_date: "2026-08-22T12:00:00Z",
+          last_calendar_update_date: "2026-08-27T12:00:00Z",
+        });
+      });
+
+      it("counts a task or calendar change as activity when there is no note at all", async () => {
+        mockCollections({ matters: [MATTER_A, MATTER_B], changedTasks: [task], changedCalendar: [{ ...entry, matter: { id: 2 } }] });
+        const { parsed } = await run();
+        const byId = Object.fromEntries(parsed.matters.map((m: any) => [m.matter_id, m]));
+        expect(byId[1].last_note_date).toBeNull();
+        expect(byId[1].days_since_last_activity).toBe(10);
+        expect(byId[2].days_since_last_activity).toBe(5);
+      });
+
+      it("uses updated_at over created_at, so an old task completed recently is recent activity", async () => {
+        mockCollections({
+          matters: [MATTER_A],
+          changedTasks: [{ id: 2, status: "complete", created_at: "2026-03-01T09:00:00Z", updated_at: "2026-08-29T12:00:00Z", matter: { id: 1 } }],
+        });
+        const { parsed } = await run();
+        expect(parsed.matters[0].days_since_last_activity).toBe(3);
+        // It is activity, but it is not an open task.
+        expect(parsed.matters[0].open_tasks_count).toBe(0);
+      });
+
+      it("falls back to created_at when a record carries no updated_at", async () => {
+        mockCollections({ matters: [MATTER_A], changedCalendar: [{ id: 3, created_at: "2026-08-25T12:00:00Z", matter: { id: 1 } }] });
+        const { parsed } = await run();
+        expect(parsed.matters[0].days_since_last_activity).toBe(7);
+      });
+
+      it("stays null when none of the three has anything in the window", async () => {
+        mockCollections({ matters: [MATTER_A] });
+        const { parsed } = await run();
+        expect(parsed.matters[0].days_since_last_activity).toBeNull();
+        expect(parsed.matters[0].last_task_update_date).toBeNull();
+        expect(parsed.matters[0].last_calendar_update_date).toBeNull();
+      });
+
+      it("does not leak one matter's task or calendar change into another", async () => {
+        mockCollections({ matters: [MATTER_A, MATTER_B], changedTasks: [task], changedCalendar: [entry] });
+        const { parsed } = await run();
+        const byId = Object.fromEntries(parsed.matters.map((m: any) => [m.matter_id, m]));
+        expect(byId[2].days_since_last_activity).toBeNull();
+      });
     });
 
     it("prefers the note's own date over when it was typed up", async () => {
@@ -289,7 +386,7 @@ describe("page budget", () => {
     mockClioGetAllPages.mockResolvedValue([]);
     await handlers["matter_activity_summary"](ARGS);
 
-    expect(mockClioGetAllPages).toHaveBeenCalledTimes(4);
+    expect(mockClioGetAllPages).toHaveBeenCalledTimes(6);
     for (const call of mockClioGetAllPages.mock.calls) {
       expect(call[2], `${call[0]} was read without a page budget`).toMatchObject({ maxPages: expect.any(Number) });
     }

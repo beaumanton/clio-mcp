@@ -18,12 +18,17 @@ import { appendAuditLog } from "../utils/auditLog.js";
  * triage pass meant to decide which matters deserve a closer look, and keeping
  * it thin is what makes it cheap to run over the whole book on a schedule.
  *
- * This fork never reads Clio's activities endpoint (time entries and expenses),
- * so "last activity" here means the newest matter note.
+ * This fork never reads Clio's activities endpoint (time entries and expenses).
+ * "Last activity" is the newest of three signals inside the lookback window: a
+ * matter note, a task created or updated, and a calendar entry created or
+ * updated. The last two need their own reads, because the task read that feeds
+ * the open-task count only sees pending tasks and the calendar read that feeds
+ * the next entry only sees future ones: a task completed yesterday, or a hearing
+ * recorded last week, is activity that neither of those would show.
  */
 
 /**
- * Page budget per collection. Four collections are read in parallel and the
+ * Page budget per read. Six reads run in parallel and the
  * whole tool has to answer inside an MCP client's request timeout (60s in Claude
  * Desktop). A firm large enough to blow past this gets a clear error naming the
  * knobs that shrink the window, rather than a client-side timeout with no
@@ -36,6 +41,18 @@ const SUMMARY_MATTER_FIELDS = "id,display_number,description,status,client{id,na
 const SUMMARY_NOTE_FIELDS = "id,date,created_at,matter{id}";
 const SUMMARY_CALENDAR_FIELDS = "id,summary,start_at,matter{id}";
 const SUMMARY_TASK_FIELDS = "id,due_at,status,matter{id}";
+// Change reads carry timestamps only: no task name, no calendar summary.
+const SUMMARY_CHANGE_FIELDS = "id,created_at,updated_at,matter{id}";
+
+/**
+ * Clio's calendar listing is read with an explicit from/to window everywhere in
+ * this codebase, and that is the combination the export probe confirmed honours
+ * updated_since. A changed entry can be dated anywhere (a hearing recorded after
+ * the fact, a listing two years out), so the window is deliberately wide and
+ * updated_since does the narrowing.
+ */
+const CALENDAR_CHANGE_FROM = "1990-01-01T00:00:00Z";
+const CALENDAR_CHANGE_YEARS_AHEAD = 10;
 
 /** Newest of a set of date-ish strings, ignoring blanks and unparseable values. */
 function latest(dates: (string | null | undefined)[]): string | null {
@@ -82,7 +99,7 @@ export function registerActivitySummaryTools(server: McpServer): void {
     "matter_activity_summary",
     {
       description:
-        "Activity snapshot for every open matter in one call: last note, next calendar entry, open task count, and days since the last note. Sorted by staleness, so matters with no recent notes come first. Use this as the cheap first pass of a case-monitoring sweep, then look closely only at what it flags.",
+        "Activity snapshot for every open matter in one call: last note, last task change, last calendar entry change, next calendar entry, open task count, and days since the most recent of those three activity dates. Sorted by staleness, so matters with no recent activity come first. Use this as the cheap first pass of a case-monitoring sweep, then look closely only at what it flags.",
       inputSchema: {
         lookback_days: z
           .number()
@@ -91,7 +108,7 @@ export function registerActivitySummaryTools(server: McpServer): void {
           .max(365)
           .default(90)
           .describe(
-            "How far back to look for notes. A matter with nothing in this window reports " +
+            "How far back to look for notes, tasks created or updated, and calendar entries created or updated. A matter with nothing in this window reports " +
               "null and counts as maximally stale. Staleness uses a note's own date, not when it was imported, " +
               "so a note created inside the window but dated years earlier can push days_since_last_activity " +
               "well past lookback_days; that is the event date doing its job, not a bug. Capped at 365 because " +
@@ -127,6 +144,7 @@ export function registerActivitySummaryTools(server: McpServer): void {
         const since = isoDaysAgo(lookback_days, now);
         const todayDate = new Date(now).toISOString().slice(0, 10);
         const aheadDate = new Date(now + calendar_days_ahead * 86_400_000).toISOString().slice(0, 10);
+        const calendarChangeTo = `${new Date(now).getUTCFullYear() + CALENDAR_CHANGE_YEARS_AHEAD}-12-31T23:59:59Z`;
 
         const matterParams: Record<string, string> = {
           fields: SUMMARY_MATTER_FIELDS,
@@ -135,7 +153,7 @@ export function registerActivitySummaryTools(server: McpServer): void {
         };
         if (practice_area_id) matterParams["practice_area_id"] = String(practice_area_id);
 
-        // Four account-wide reads, not four per matter.
+        // Six account-wide reads, not six per matter.
         const readAll = (path: string, params: Record<string, string>) =>
           clioGetAllPages(path, params, { maxPages: SUMMARY_MAX_PAGES }).catch((err: any) => {
             if (typeof err?.message === "string" && err.message.includes("exceeded maxPages")) {
@@ -148,7 +166,7 @@ export function registerActivitySummaryTools(server: McpServer): void {
             throw err;
           });
 
-        const [matters, notes, calendarEntries, tasks] = await Promise.all([
+        const [matters, notes, calendarEntries, tasks, changedTasks, changedCalendarEntries] = await Promise.all([
           readAll("/matters.json", matterParams),
           readAll("/notes.json", {
             fields: SUMMARY_NOTE_FIELDS,
@@ -167,14 +185,33 @@ export function registerActivitySummaryTools(server: McpServer): void {
             status: "pending",
             limit: "200",
           }),
+          // Any status: completing a task is an update, and it is activity.
+          readAll("/tasks.json", {
+            fields: SUMMARY_CHANGE_FIELDS,
+            updated_since: since,
+            limit: "200",
+          }),
+          readAll("/calendar_entries.json", {
+            fields: SUMMARY_CHANGE_FIELDS,
+            from: CALENDAR_CHANGE_FROM,
+            to: calendarChangeTo,
+            updated_since: since,
+            limit: "200",
+          }),
         ]);
 
         const notesByMatter = groupByMatter(notes);
         const calendarByMatter = groupByMatter(calendarEntries);
         const tasksByMatter = groupByMatter(tasks);
+        const changedTasksByMatter = groupByMatter(changedTasks);
+        const changedCalendarByMatter = groupByMatter(changedCalendarEntries);
+        const lastChange = (records: any[] | undefined) =>
+          latest((records ?? []).flatMap((r) => [r.created_at, r.updated_at]));
 
         const rows = matters.map((m: any) => {
           const lastNote = latest((notesByMatter.get(m.id) ?? []).map((n) => n.date ?? n.created_at));
+          const lastTaskChange = lastChange(changedTasksByMatter.get(m.id));
+          const lastCalendarChange = lastChange(changedCalendarByMatter.get(m.id));
 
           const upcoming = (calendarByMatter.get(m.id) ?? [])
             .filter((c) => c.start_at && Date.parse(c.start_at) >= now)
@@ -187,15 +224,17 @@ export function registerActivitySummaryTools(server: McpServer): void {
             description: m.description,
             client: m.client?.name ?? null,
             last_note_date: lastNote,
+            last_task_update_date: lastTaskChange,
+            last_calendar_update_date: lastCalendarChange,
             next_calendar_entry: nextEntry
               ? { start_at: nextEntry.start_at, summary: nextEntry.summary ?? null }
               : null,
             open_tasks_count: (tasksByMatter.get(m.id) ?? []).length,
-            // Notes are the only activity signal. null means no note inside the
-            // lookback window, which is a
-            // stronger signal than any number this can return. Sorting treats it
-            // as the stalest possible value for exactly that reason.
-            days_since_last_activity: daysBetween(lastNote, now),
+            // Newest of the three activity dates. null means nothing at all inside
+            // the lookback window, which is a stronger signal than any number this
+            // can return. Sorting treats it as the stalest possible value for
+            // exactly that reason.
+            days_since_last_activity: daysBetween(latest([lastNote, lastTaskChange, lastCalendarChange]), now),
           };
         });
 

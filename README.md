@@ -476,7 +476,7 @@ Claude selects and calls these tools automatically based on your questions. You 
 
 | Tool | Inputs | What it does |
 |---|---|---|
-| `matter_activity_summary` | `lookback_days`, `calendar_days_ahead`, `practice_area_id`, `stale_after_days`, `limit` | Last note, next calendar entry, open task count and days since the last note, for every open matter in one call, quietest first. Reads each collection once account-wide, so cost does not scale with the size of the book |
+| `matter_activity_summary` | `lookback_days`, `calendar_days_ahead`, `practice_area_id`, `stale_after_days`, `limit` | Last note, last task change, last calendar entry change, next calendar entry, open task count and days since the most recent of those three activity dates, for every open matter in one call, quietest first. Reads each collection once account-wide, so cost does not scale with the size of the book |
 
 ### Users (2 tools)
 
